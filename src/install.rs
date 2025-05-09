@@ -10,6 +10,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
 
 use crate::args::{Arg, Args};
+use crate::base::AurBase;
 use crate::chroot::Chroot;
 use crate::clean::clean_untracked;
 use crate::completion::update_aur_cache;
@@ -30,6 +31,7 @@ use alpm_utils::{DbListExt, Targ};
 use ansiterm::Style;
 use anyhow::{bail, ensure, Context, Result};
 use aur_depends::{Actions, Base, Conflict, DepMissing, RepoPackage};
+use git2::{Repository, Remote};
 use log::debug;
 use raur::Cache;
 use srcinfo::{ArchVec, Srcinfo};
@@ -79,9 +81,50 @@ pub async fn install(config: &mut Config, targets_str: &[String]) -> Result<()> 
     installer.install(config, targets_str).await
 }
 
+async fn git_clone(url: &str, dest: &Path) -> Result<()> {
+    let mut repo = git2::Repository::init(dest)?;
+    let mut remote = repo.remote_anonymous(url)?;
+    remote.fetch(&["refs/heads/*:refs/remotes/origin/*"], None, None)?;
+    Ok(())
+}
+async fn clone_packages(
+    config: &Config,
+    bases: &[AurBase],
+    temp_dir: &Path,
+) -> Result<HashMap<String, PathBuf>> {
+    let mut cloned_paths = HashMap::new();
+    
+    // Create tasks for parallel cloning
+    let clone_tasks = bases.iter().map(|base| {
+        let temp_dir = temp_dir.to_path_buf();
+        let config = config.clone();
+        async move {
+            let pkg_name = base.pkgs[0].pkg.name.clone();
+            let pkg_dir = temp_dir.join(&pkg_name);
+            if !pkg_dir.exists() {
+                let url = format!("https://aur.archlinux.org/{}.git", pkg_name);
+                git_clone(&url, &pkg_dir).await?;
+            }
+            Ok((pkg_name, pkg_dir))
+        }
+    });
+
+    // Wait for all clones to complete
+    let cloned_packages = futures::future::join_all(clone_tasks).await;
+    
+    // Collect results
+    for result in cloned_packages {
+        if let Ok((name, path)) = result {
+            cloned_paths.insert(name, path);
+        }
+    }
+
+    Ok(cloned_paths)
+}
+
 pub async fn build_dirs(config: &mut Config, dirs: Vec<PathBuf>) -> Result<()> {
     let mut installer = Installer::new(config);
-    let repo = PkgbuildRepo::from_pkgbuilds(config, &dirs)?;
+  /*   let repo = PkgbuildRepo::from_pkgbuilds(config, &dirs)?;
 
     let targets = repo
         .pkgs(config)
@@ -92,7 +135,46 @@ pub async fn build_dirs(config: &mut Config, dirs: Vec<PathBuf>) -> Result<()> {
 
     config.pkgbuild_repos.repos.push(repo);
     installer.install_targets = config.install;
-    installer.install(config, &targets).await
+    installer.install(config, &targets).await */
+    let temp_dir = tempfile::tempdir()?;
+    let cloned_paths = clone_packages(config, bases, temp_dir.path()).await?;
+    if !config.no_confirm {
+        if let Some(ref fm) = config.fm {
+            // Show all cloned packages in the file manager
+            let pkgs: Vec<&str> = cloned_paths.keys().map(|s| s.as_str()).collect();
+            let _view = file_manager(config, &config.fetch, fm, &pkgs)?;
+            
+            // Ask for confirmation
+            if !ask(config, &tr!("Accept changes?"), true) {
+                return Status::err(1);
+            }
+        }
+    }
+    for (pkg_name, path) in &cloned_paths {
+        // Force regeneration of SRCINFO
+        let repo = PkgbuildRepo::new(pkg_name.clone(), path.clone());
+        repo.source = RepoSource::Path(path.clone());
+        repo.depth = 3;
+        repo.skip_review = true;
+        repo.force_srcinfo = true;
+        config.pkgbuild_repos.generate_srcinfos(config)?;
+        let repo = PkgbuildRepo::from_pkgbuilds(config, &dirs)?;
+    
+        let targets = repo
+            .pkgs(config)
+            .iter()
+            .flat_map(|s| s.srcinfo.names())
+            .map(|name| format!("./{}", name))
+            .collect::<Vec<_>>();
+    
+        config.pkgbuild_repos.repos.push(repo);
+        installer.install_targets = config.install;
+        installer.install(config, &targets).await?
+        
+    
+    }
+    Ok(())
+
 }
 
 impl Installer {
@@ -1055,6 +1137,8 @@ impl Installer {
         aur_targets.is_empty() && upgrades.aur_keep.is_empty() && upgrades.pkgbuild_keep.is_empty()
     }
 
+
+
     async fn prepare_build(
         &mut self,
         config: &Config,
@@ -1257,7 +1341,6 @@ fn print_warnings(config: &Config, cache: &Cache, actions: Option<&Actions>) {
     if !config.mode.aur() && !config.mode.pkgbuild() {
         return;
     }
-
     if config.args.has_arg("u", "sysupgrade") && config.mode.aur() {
         let (_, mut pkgs) = repo_aur_pkgs(config);
         pkgs.retain(|pkg| config.pkgbuild_repos.pkg(config, pkg.name()).is_none());
